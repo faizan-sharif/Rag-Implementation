@@ -20,9 +20,9 @@ CHUNK_SIZE    = 1500
 CHUNK_OVERLAP = 150
 
 # Retrieval
-RETRIEVER_K       = 10
-RETRIEVER_FETCH_K = 40
-RETRIEVER_LAMBDA  = 0.5
-BM25_K            = 10
+RETRIEVER_K       = 15
+RETRIEVER_FETCH_K = 60
+RETRIEVER_LAMBDA  = 0.7
+BM25_K            = 15
 
 SUPPORTED_EXTENSIONS = [".pdf", ".txt", ".md", ".docx"]

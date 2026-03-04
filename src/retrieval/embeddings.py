@@ -4,7 +4,6 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-
 def get_embeddings() -> HuggingFaceEmbeddings:
     """
     all-mpnet-base-v2:

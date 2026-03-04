@@ -3,18 +3,17 @@ document_loader.py
 ==================
 Advanced table-aware PDF loader using pdfplumber.
 
-Key techniques:
-  1. Per-page table extraction  -> markdown pipe format (LLM-readable)
-  2. Header propagation         -> multi-page tables get repeated column headers
-  3. Row context injection      -> each table row also stored as individual Document
-     so needle-in-haystack lookups ("Police budget 2025-26") hit directly
-  4. Raw text fallback          -> text between tables captured separately
-  5. Rich metadata              -> page, type, table_index, row_index, source
+Fixes in this version:
+  - Section header injection: each chunk knows what section it belongs to
+  - Keyword tagging: ADP/development rows tagged in metadata for boosted retrieval
+  - Natural language row description added alongside pipe format
+  - More aggressive table extraction for merged/complex cells
+  - Alias expansion stored in metadata
 """
 
 import os
 import re
-from typing import List
+from typing import List, Optional
 
 import pdfplumber
 from langchain_core.documents import Document
@@ -24,7 +23,6 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Punjab Budget column aliases for normalisation
 FISCAL_COL_ALIASES = {
     "accounts 2023-24":           "Accounts 2023-24",
     "account 2023-24":            "Accounts 2023-24",
@@ -35,6 +33,18 @@ FISCAL_COL_ALIASES = {
     "budget estimates 2025-26":   "Budget Estimates 2025-26",
     "budget estimate 2025-26":    "Budget Estimates 2025-26",
 }
+
+# Known section keywords to detect and propagate as context
+SECTION_KEYWORDS = [
+    "annual development program", "adp",
+    "current expenditure", "capital expenditure",
+    "revenue receipts", "revenue expenditure",
+    "public sector development",
+    "consolidated fund", "provincial consolidated fund",
+    "general administration", "finance department",
+    "health", "education", "police", "agriculture",
+    "pension", "debt servicing",
+]
 
 
 def load_documents(documents_dir: str) -> List[Document]:
@@ -49,12 +59,10 @@ def load_documents(documents_dir: str) -> List[Document]:
             continue
         filepath = os.path.join(documents_dir, filename)
         logger.info(f"Loading: {filename}")
-
         if ext == ".pdf":
             docs = load_pdf(filepath)
         else:
             docs = load_text_file(filepath)
-
         logger.info(f"  -> {len(docs)} chunks from {filename}")
         all_docs.extend(docs)
 
@@ -62,29 +70,21 @@ def load_documents(documents_dir: str) -> List[Document]:
     return all_docs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PDF loader
-# ─────────────────────────────────────────────────────────────────────────────
-
 def load_pdf(filepath: str) -> List[Document]:
     docs: List[Document] = []
     filename = os.path.basename(filepath)
-    last_header: List[str] = []          # propagate headers across pages
+    last_header: List[str] = []
+    current_section: str = ""
 
     with pdfplumber.open(filepath) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
 
-            # ── 1. Extract tables ──────────────────────────────────────────
-            tables = page.extract_tables(
-                table_settings={
-                    "vertical_strategy":   "lines",
-                    "horizontal_strategy": "lines",
-                    "snap_tolerance":       5,
-                    "join_tolerance":       3,
-                    "min_words_vertical":   1,
-                    "min_words_horizontal": 1,
-                }
-            )
+            # Detect section from page text first
+            raw_text = page.extract_text() or ""
+            current_section = detect_section(raw_text, current_section)
+
+            # Try multiple table extraction strategies
+            tables = _extract_tables(page)
 
             if tables:
                 for t_idx, raw_table in enumerate(tables):
@@ -92,12 +92,11 @@ def load_pdf(filepath: str) -> List[Document]:
                     if not cleaned:
                         continue
 
-                    # Detect if first row is a header row
                     header, data_rows = detect_header(cleaned, last_header)
                     if header:
-                        last_header = header  # propagate for next page
+                        last_header = header
 
-                    # ── 2. Whole-table document ────────────────────────────
+                    # Whole-table document
                     md = build_markdown_table(header, data_rows)
                     if md:
                         docs.append(Document(
@@ -107,42 +106,80 @@ def load_pdf(filepath: str) -> List[Document]:
                                 "page":        page_num,
                                 "type":        "table",
                                 "table_index": t_idx,
+                                "section":     current_section,
                                 "row_count":   len(data_rows),
                             }
                         ))
 
-                    # ── 3. Per-row documents (for precise cell lookup) ─────
+                    # Per-row documents with section context injected
                     if header:
                         for r_idx, row in enumerate(data_rows):
                             row_doc = build_row_document(
-                                header, row, filename, page_num, t_idx, r_idx
+                                header, row, filename, page_num,
+                                t_idx, r_idx, current_section
                             )
                             if row_doc:
                                 docs.append(row_doc)
 
-            # ── 4. Raw text (non-table content) ───────────────────────────
-            raw_text = page.extract_text()
+            # Raw text
             if raw_text:
                 cleaned_text = clean_raw_text(raw_text)
                 if len(cleaned_text) > 60:
                     docs.append(Document(
                         page_content=cleaned_text,
                         metadata={
-                            "source": filename,
-                            "page":   page_num,
-                            "type":   "text",
+                            "source":  filename,
+                            "page":    page_num,
+                            "type":    "text",
+                            "section": current_section,
                         }
                     ))
 
     return docs
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Table helpers
-# ─────────────────────────────────────────────────────────────────────────────
+def _extract_tables(page) -> list:
+    """Try multiple extraction strategies, return best result."""
+    # Strategy 1: line-based (best for ruled tables)
+    tables = page.extract_tables({
+        "vertical_strategy":   "lines",
+        "horizontal_strategy": "lines",
+        "snap_tolerance":       5,
+        "join_tolerance":       3,
+        "min_words_vertical":   1,
+        "min_words_horizontal": 1,
+    })
+    if tables:
+        return tables
+
+    # Strategy 2: text-based (for tables without visible lines)
+    tables = page.extract_tables({
+        "vertical_strategy":   "text",
+        "horizontal_strategy": "text",
+        "snap_tolerance":       3,
+    })
+    if tables:
+        return tables
+
+    # Strategy 3: explicit lines only
+    tables = page.extract_tables({
+        "vertical_strategy":   "explicit",
+        "horizontal_strategy": "lines",
+        "explicit_vertical_lines": page.curves + page.edges,
+    })
+    return tables or []
+
+
+def detect_section(text: str, current_section: str) -> str:
+    """Detect the current budget section from page text."""
+    text_lower = text.lower()
+    for kw in SECTION_KEYWORDS:
+        if kw in text_lower:
+            return kw.title()
+    return current_section
+
 
 def clean_table(raw_table: list) -> list:
-    """Remove None cells, strip whitespace, drop fully-empty rows."""
     cleaned = []
     for row in raw_table:
         clean_row = [
@@ -155,33 +192,27 @@ def clean_table(raw_table: list) -> list:
 
 
 def detect_header(rows: list, last_header: list) -> tuple:
-    """
-    Heuristic: first row is header if it contains known fiscal year strings
-    or has no purely-numeric cells.
-    Falls back to last_header for continuation pages.
-    """
     if not rows:
         return last_header, rows
 
     first = rows[0]
     first_lower = [c.lower() for c in first]
 
-    fiscal_keywords = ["accounts", "budget", "revised", "estimates", "head"]
+    fiscal_keywords = ["accounts", "budget", "revised", "estimates", "head", "description", "particulars"]
     is_header = any(
         any(kw in cell for kw in fiscal_keywords)
         for cell in first_lower
     )
-    # Also treat as header if no cell parses as a large number
+
     numeric_cells = sum(
         1 for c in first
-        if re.sub(r"[,\s]", "", c).replace(".", "", 1).replace("-", "", 1).isdigit()
+        if re.sub(r"[,\s]", "", c).replace(".", "", 1).replace("-", "", 1).lstrip("-").isdigit()
         and len(re.sub(r"[,\s]", "", c)) > 4
     )
-    if numeric_cells == 0:
+    if numeric_cells == 0 and any(c.strip() for c in first):
         is_header = True
 
     if is_header:
-        # Normalise column names
         header = [normalise_col(c) for c in first]
         return header, rows[1:]
     else:
@@ -194,7 +225,6 @@ def normalise_col(col: str) -> str:
 
 
 def build_markdown_table(header: list, rows: list) -> str:
-    """Build a pipe-delimited markdown table string."""
     if not rows:
         return ""
     lines = []
@@ -209,13 +239,9 @@ def build_markdown_table(header: list, rows: list) -> str:
 
 def build_row_document(
     header: list, row: list, source: str,
-    page: int, t_idx: int, r_idx: int
-) -> Document | None:
-    """
-    Create a fine-grained Document for a single table row.
-    Format: "Head of Account: X | Accounts 2023-24: Y | Budget Estimates 2024-25: Z | ..."
-    This lets the retriever match "Police 2025-26" -> this exact row.
-    """
+    page: int, t_idx: int, r_idx: int,
+    section: str = ""
+) -> Optional[Document]:
     if not header or not row:
         return None
 
@@ -225,30 +251,47 @@ def build_row_document(
         if val.strip():
             pairs.append(f"{col}: {val.strip()}")
 
-    if not pairs:
+    if not pairs or len(" | ".join(pairs)) < 10:
         return None
 
-    content = " | ".join(pairs)
+    # Format 1: pipe-delimited (for exact lookup)
+    pipe_content = " | ".join(pairs)
 
-    # Skip rows that are pure separators or sub-headers
-    if len(content) < 10:
-        return None
+    # Format 2: natural language sentence (better semantic embedding)
+    head_val = padded[0].strip() if padded else ""
+    nl_parts = [f"The budget entry for '{head_val}'"]
+    if section:
+        nl_parts.append(f"under {section}")
+    for col, val in zip(header[1:], padded[1:]):
+        if val.strip() and col.strip():
+            nl_parts.append(f"has {col} of Rs. {val.strip()} million")
+    nl_sentence = " ".join(nl_parts) + "."
+
+    # Combine both representations
+    full_content = f"{pipe_content}\n{nl_sentence}"
+
+    # Detect keywords for metadata tagging
+    tags = []
+    content_lower = full_content.lower()
+    for kw in ["adp", "annual development", "development program",
+               "current expenditure", "capital", "pension",
+               "revenue", "salary", "grant"]:
+        if kw in content_lower:
+            tags.append(kw)
 
     return Document(
-        page_content=content,
+        page_content=full_content,
         metadata={
             "source":      source,
             "page":        page,
             "type":        "table_row",
             "table_index": t_idx,
             "row_index":   r_idx,
+            "section":     section,
+            "tags":        ",".join(tags),
         }
     )
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Text helpers
-# ─────────────────────────────────────────────────────────────────────────────
 
 def clean_raw_text(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
