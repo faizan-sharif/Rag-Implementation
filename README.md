@@ -1,4 +1,4 @@
-# Punjab Budget RAG — Financial Analyst System
+# Rag System for tabular data
 
 > AI-powered Q&A over the Punjab Government Annual Budget Statement 2025-26.
 > Returns precise tabular answers in structured table format. All figures in **Rs. millions**.
@@ -7,7 +7,7 @@
 
 ## What This System Does
 
-Ask natural language questions about the Punjab Budget and get precise answers like:
+Ask natural language questions about the Tabular Data and get precise answers like:
 
 ```
 Question: What is Total Revenue (A=B+C) for Budget Estimates 2025-26?
